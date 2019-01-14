@@ -210,6 +210,8 @@ impl<T: Trait> Module<T> {
 		<timestamp::Module<T>>::block_period().as_().saturating_mul(2)
 	}
 
+	pub fn authorities() {}
+
 	fn on_timestamp_set<H: HandleReport>(now: T::Moment, slot_duration: T::Moment) {
 		let last = Self::last();
 		<Self as Store>::LastTimestamp::put(now.clone());
