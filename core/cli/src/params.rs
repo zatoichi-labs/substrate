@@ -216,14 +216,6 @@ pub enum CoreCommands {
 		#[structopt(parse(from_os_str))]
 		input: Option<PathBuf>,
 
-		/// The means of execution used when executing blocks. Can be either wasm, native, nativeElseWasm or both.
-		#[structopt(long = "execution", value_name = "STRATEGY")]
-		execution: ExecutionStrategy,
-
-		/// The means of execution used when calling into the runtime. Can be either wasm, native, nativeElseWasm or both.
-		#[structopt(long = "api-execution", value_name = "STRATEGY")]
-		api_execution: ExecutionStrategy,
-
 		/// The maximum number of 64KB pages to ever allocate for Wasm execution. Don't alter this unless you know what you're doing.
 		#[structopt(long = "max-heap-pages", value_name = "COUNT")]
 		max_heap_pages: Option<u32>,
