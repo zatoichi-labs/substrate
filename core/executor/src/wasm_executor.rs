@@ -35,6 +35,7 @@ use primitives::{H256, Blake2Hasher};
 use trie::ordered_trie_root;
 use sandbox;
 use heap;
+use sharedlib::{Func, Lib, Symbol};
 
 #[cfg(feature="wasm-extern-trace")]
 macro_rules! debug_trace {
@@ -678,6 +679,22 @@ impl WasmExecutor {
 			.clone())
 	}
 
+	pub fn invoke_in_so(&self, method: &str, offset: i32, size: i32) -> i64 {
+        unsafe {
+            let path_to_lib = "libbar.so";
+            let lib = Lib::new(path_to_lib).unwrap();
+            let hello_world_symbol: Func<extern "C" fn()> = lib.find_func(method).unwrap();
+            let hello_world = hello_world_symbol.get();
+            hello_world()
+
+            /*
+            let hello_world_symbol: Func<extern "C" fn()> = try!(lib.find_func("hello_world"));
+            let hello_world = hello_world_symbol.get();
+            hello_world();
+            */
+        }
+    }
+
 	/// Call a given method in the given wasm-module runtime.
 	pub fn call_in_wasm_module<E: Externalities<Blake2Hasher>>(
 		&self,
@@ -700,13 +717,17 @@ impl WasmExecutor {
 		let offset = fec.heap.allocate(size);
 		memory.set(offset, &data)?;
 
-        /*
         let arc_ref = &mut fec;
         *thisFE.lock().unwrap() = Some(unsafe { mem::transmute(arc_ref) });
-        let result = call_in_so(method, I32(offset as i32), I32(size as i32));
-        let result = Ok(Some(result));
-        */
+        let result = self.invoke_in_so(method, offset as i32, size as i32);
+        //let result: Result<<Option<i64>, i64> = Ok(Some(I64(result as i64)));
 
+        let r = result as u32;
+        let offset = r as u32;
+        let length = (r >> 32) as u32 as usize;
+        let result = memory.get(offset, length).map_err(|_| ErrorKind::Runtime.into());
+
+        /*
 		let result = module_instance.invoke_export(
 			method,
 			&[
@@ -715,7 +736,9 @@ impl WasmExecutor {
 			],
 			&mut fec
 		);
+        */
 
+        /*
 		let result = match result {
 			Ok(Some(I64(r))) => {
 				let offset = r as u32;
@@ -724,11 +747,14 @@ impl WasmExecutor {
 					.map_err(|_| ErrorKind::Runtime.into())
 			},
 			Ok(_) => Err(ErrorKind::InvalidReturn.into()),
+            /*
 			Err(e) => {
 				trace!(target: "wasm-executor", "Failed to execute code with {} pages", memory.current_size().0);
 				Err(e.into())
 			},
+            */
 		};
+        */
 
 		// cleanup module instance for next use
 		let new_low = memory.lowest_used();

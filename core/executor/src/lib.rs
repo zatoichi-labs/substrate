@@ -45,6 +45,7 @@ extern crate substrate_trie as trie;
 extern crate wasmi;
 extern crate byteorder;
 extern crate parking_lot;
+extern crate sharedlib;
 
 #[macro_use]
 extern crate log;
