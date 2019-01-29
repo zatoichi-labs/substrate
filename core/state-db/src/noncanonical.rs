@@ -204,6 +204,7 @@ impl<BlockHash: Hash, Key: Hash> NonCanonicalOverlay<BlockHash, Key> {
 			level.iter().for_each(|overlay| {
 				let parent = self.parents.get(&overlay.hash).expect("there is a parent entry for each entry in levels; qed").clone();
 				if parent == *hash {
+					discarded_journals.push(overlay.journal_key.clone());
 					self.discard_journals(level_index + 1, discarded_journals, &overlay.hash);
 				}
 			});
@@ -243,7 +244,7 @@ impl<BlockHash: Hash, Key: Hash> NonCanonicalOverlay<BlockHash, Key> {
 				commit.data.inserted = overlay.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 				commit.data.deleted = overlay.deleted.clone();
 			} else {
-				self.discard_journals(self.pending_canonicalizations.len(), &mut discarded_journals, &overlay.hash);
+				self.discard_journals(self.pending_canonicalizations.len() + 1, &mut discarded_journals, &overlay.hash);
 			}
 			discarded_journals.push(overlay.journal_key.clone());
 		}
@@ -338,7 +339,7 @@ impl<BlockHash: Hash, Key: Hash> NonCanonicalOverlay<BlockHash, Key> {
 #[cfg(test)]
 mod tests {
 	use std::io;
-	use super::NonCanonicalOverlay;
+	use super::{NonCanonicalOverlay, to_journal_key};
 	use {ChangeSet};
 	use primitives::H256;
 	use test::{make_db, make_changeset};
@@ -497,6 +498,7 @@ mod tests {
 
 	#[test]
 	fn complex_tree() {
+		use MetaDb;
 		let mut db = make_db(&[]);
 
 		// - 1 - 1_1 - 1_1_1
@@ -567,6 +569,13 @@ mod tests {
 		assert!(!contains(&overlay, 22));
 		assert!(!contains(&overlay, 211));
 		assert!(contains(&overlay, 111));
+		assert!(!contains(&overlay, 211));
+		// check that journals are deleted
+		assert!(db.get_meta(&to_journal_key(1, 0)).unwrap().is_none());
+		assert!(db.get_meta(&to_journal_key(1, 1)).unwrap().is_none());
+		assert!(db.get_meta(&to_journal_key(2, 1)).unwrap().is_some());
+		assert!(db.get_meta(&to_journal_key(2, 2)).unwrap().is_none());
+		assert!(db.get_meta(&to_journal_key(2, 3)).unwrap().is_none());
 
 		// canonicalize 1_2. 1_1 and all its children should be discarded
 		db.commit(&overlay.canonicalize::<io::Error>(&h_1_2).unwrap());
