@@ -28,6 +28,9 @@
 #![warn(missing_docs)]
 #![recursion_limit="128"]
 
+#[macro_use]
+extern crate lazy_static;
+
 extern crate tiny_keccak;
 extern crate secp256k1;
 extern crate parity_codec as codec;
