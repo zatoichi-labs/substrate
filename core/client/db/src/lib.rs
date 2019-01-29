@@ -49,10 +49,10 @@ use runtime_primitives::BuildStorage;
 use state_machine::backend::Backend as StateBackend;
 use executor::RuntimeInfo;
 use state_machine::{CodeExecutor, DBValue, ExecutionStrategy};
-use utils::{Meta, db_err, meta_keys, open_database, read_db, block_id_to_lookup_key, read_meta};
+use crate::utils::{Meta, db_err, meta_keys, open_database, read_db, block_id_to_lookup_key, read_meta};
 use client::LeafSet;
 use state_db::StateDb;
-use storage_cache::{CachingState, SharedCache, new_shared_cache};
+use crate::storage_cache::{CachingState, SharedCache, new_shared_cache};
 use log::{trace, debug, warn};
 pub use state_db::PruningMode;
 
@@ -759,10 +759,8 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 
 			let header = &pending_block.header;
 			let is_best = pending_block.leaf_state.is_best();
-			let changes_trie_updates = operation.changes_trie_updates;
-
 		
-			self.changes_tries_storage.commit(&mut transaction, changes_trie_updates);
+			self.changes_tries_storage.commit(&mut transaction, operation.changes_trie_updates);
 
 			if finalized {
 				// TODO: ensure best chain contains this block.
