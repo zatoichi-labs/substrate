@@ -17,7 +17,7 @@
 
 //! Traits for managing information attached to pallets and their constituents.
 
-use codec::{Encode, Decode};
+use codec::{Decode, Encode};
 use sp_runtime::RuntimeDebug;
 
 /// Provides information about the pallet setup in the runtime.
@@ -29,6 +29,16 @@ pub trait PalletInfo {
 	fn index<P: 'static>() -> Option<usize>;
 	/// Convert the given pallet `P` into its name as configured in the runtime.
 	fn name<P: 'static>() -> Option<&'static str>;
+}
+
+/// Provides information about the pallet setup in the runtime.
+///
+/// Access the information provided by [`PalletInfo`] for a specific pallet.
+pub trait PalletInfoAccess {
+	/// Index of the pallet as configured in the runtime.
+	fn index() -> usize;
+	/// Name of the pallet as configured in the runtime.
+	fn name() -> &'static str;
 }
 
 /// The function and pallet name of the Call.
@@ -81,11 +91,7 @@ pub struct PalletVersion {
 impl PalletVersion {
 	/// Creates a new instance of `Self`.
 	pub fn new(major: u16, minor: u8, patch: u8) -> Self {
-		Self {
-			major,
-			minor,
-			patch,
-		}
+		Self { major, minor, patch }
 	}
 
 	/// Returns the storage key for a pallet version.
@@ -129,13 +135,10 @@ impl PalletVersion {
 
 impl sp_std::cmp::PartialOrd for PalletVersion {
 	fn partial_cmp(&self, other: &Self) -> Option<sp_std::cmp::Ordering> {
-		let res = self.major
+		let res = self
+			.major
 			.cmp(&other.major)
-			.then_with(||
-				self.minor
-					.cmp(&other.minor)
-					.then_with(|| self.patch.cmp(&other.patch)
-					));
+			.then_with(|| self.minor.cmp(&other.minor).then_with(|| self.patch.cmp(&other.patch)));
 
 		Some(res)
 	}

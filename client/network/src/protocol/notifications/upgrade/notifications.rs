@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use asynchronous_codec::Framed;
 /// Notifications protocol.
 ///
 /// The Substrate notifications protocol consists in the following:
@@ -34,14 +35,18 @@
 ///
 /// Notification substreams are unidirectional. If A opens a substream with B, then B is
 /// encouraged but not required to open a substream to A as well.
-///
-
 use bytes::BytesMut;
 use futures::prelude::*;
-use asynchronous_codec::Framed;
-use libp2p::core::{UpgradeInfo, InboundUpgrade, OutboundUpgrade, upgrade};
+use libp2p::core::{upgrade, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use log::error;
-use std::{borrow::Cow, convert::{Infallible, TryFrom as _}, io, iter, mem, pin::Pin, task::{Context, Poll}};
+use std::{
+	borrow::Cow,
+	convert::{Infallible, TryFrom as _},
+	io, mem,
+	pin::Pin,
+	task::{Context, Poll},
+	vec,
+};
 use unsigned_varint::codec::UviBytes;
 
 /// Maximum allowed size of the two handshake messages, in bytes.
@@ -52,7 +57,8 @@ const MAX_HANDSHAKE_SIZE: usize = 1024;
 #[derive(Debug, Clone)]
 pub struct NotificationsIn {
 	/// Protocol name to use when negotiating the substream.
-	protocol_name: Cow<'static, str>,
+	/// The first one is the main name, while the other ones are fall backs.
+	protocol_names: Vec<Cow<'static, str>>,
 	/// Maximum allowed size for a single notification.
 	max_notification_size: u64,
 }
@@ -62,7 +68,8 @@ pub struct NotificationsIn {
 #[derive(Debug, Clone)]
 pub struct NotificationsOut {
 	/// Protocol name to use when negotiating the substream.
-	protocol_name: Cow<'static, str>,
+	/// The first one is the main name, while the other ones are fall backs.
+	protocol_names: Vec<Cow<'static, str>>,
 	/// Message to send when we start the handshake.
 	initial_message: Vec<u8>,
 	/// Maximum allowed size for a single notification.
@@ -106,74 +113,96 @@ pub struct NotificationsOutSubstream<TSubstream> {
 
 impl NotificationsIn {
 	/// Builds a new potential upgrade.
-	pub fn new(protocol_name: impl Into<Cow<'static, str>>, max_notification_size: u64) -> Self {
-		NotificationsIn {
-			protocol_name: protocol_name.into(),
-			max_notification_size,
-		}
+	pub fn new(
+		main_protocol_name: impl Into<Cow<'static, str>>,
+		fallback_names: Vec<Cow<'static, str>>,
+		max_notification_size: u64,
+	) -> Self {
+		let mut protocol_names = fallback_names;
+		protocol_names.insert(0, main_protocol_name.into());
+
+		NotificationsIn { protocol_names, max_notification_size }
 	}
 }
 
 impl UpgradeInfo for NotificationsIn {
-	type Info = Cow<'static, [u8]>;
-	type InfoIter = iter::Once<Self::Info>;
+	type Info = StringProtocolName;
+	type InfoIter = vec::IntoIter<Self::Info>;
 
 	fn protocol_info(&self) -> Self::InfoIter {
-		let bytes: Cow<'static, [u8]> = match &self.protocol_name {
-			Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-			Cow::Owned(s) => Cow::Owned(s.as_bytes().to_vec())
-		};
-		iter::once(bytes)
+		self.protocol_names
+			.iter()
+			.cloned()
+			.map(StringProtocolName)
+			.collect::<Vec<_>>()
+			.into_iter()
 	}
 }
 
 impl<TSubstream> InboundUpgrade<TSubstream> for NotificationsIn
-where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+where
+	TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-	type Output = (Vec<u8>, NotificationsInSubstream<TSubstream>);
+	type Output = NotificationsInOpen<TSubstream>;
 	type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 	type Error = NotificationsHandshakeError;
 
-	fn upgrade_inbound(
-		self,
-		mut socket: TSubstream,
-		_: Self::Info,
-	) -> Self::Future {
+	fn upgrade_inbound(self, mut socket: TSubstream, negotiated_name: Self::Info) -> Self::Future {
 		Box::pin(async move {
-			let initial_message_len = unsigned_varint::aio::read_usize(&mut socket).await?;
-			if initial_message_len > MAX_HANDSHAKE_SIZE {
+			let handshake_len = unsigned_varint::aio::read_usize(&mut socket).await?;
+			if handshake_len > MAX_HANDSHAKE_SIZE {
 				return Err(NotificationsHandshakeError::TooLarge {
-					requested: initial_message_len,
+					requested: handshake_len,
 					max: MAX_HANDSHAKE_SIZE,
-				});
+				})
 			}
 
-			let mut initial_message = vec![0u8; initial_message_len];
-			if !initial_message.is_empty() {
-				socket.read_exact(&mut initial_message).await?;
+			let mut handshake = vec![0u8; handshake_len];
+			if !handshake.is_empty() {
+				socket.read_exact(&mut handshake).await?;
 			}
 
 			let mut codec = UviBytes::default();
-			codec.set_max_len(usize::try_from(self.max_notification_size).unwrap_or(usize::max_value()));
+			codec.set_max_len(usize::try_from(self.max_notification_size).unwrap_or(usize::MAX));
 
 			let substream = NotificationsInSubstream {
 				socket: Framed::new(socket, codec),
 				handshake: NotificationsInSubstreamHandshake::NotSent,
 			};
 
-			Ok((initial_message, substream))
+			Ok(NotificationsInOpen {
+				handshake,
+				negotiated_fallback: if negotiated_name.0 == self.protocol_names[0] {
+					None
+				} else {
+					Some(negotiated_name.0)
+				},
+				substream,
+			})
 		})
 	}
 }
 
+/// Yielded by the [`NotificationsIn`] after a successfuly upgrade.
+pub struct NotificationsInOpen<TSubstream> {
+	/// Handshake sent by the remote.
+	pub handshake: Vec<u8>,
+	/// If the negotiated name is not the "main" protocol name but a fallback, contains the
+	/// name of the negotiated fallback.
+	pub negotiated_fallback: Option<Cow<'static, str>>,
+	/// Implementation of `Stream` that allows receives messages from the substream.
+	pub substream: NotificationsInSubstream<TSubstream>,
+}
+
 impl<TSubstream> NotificationsInSubstream<TSubstream>
-where TSubstream: AsyncRead + AsyncWrite + Unpin,
+where
+	TSubstream: AsyncRead + AsyncWrite + Unpin,
 {
 	/// Sends the handshake in order to inform the remote that we accept the substream.
 	pub fn send_handshake(&mut self, message: impl Into<Vec<u8>>) {
 		if !matches!(self.handshake, NotificationsInSubstreamHandshake::NotSent) {
 			error!(target: "sub-libp2p", "Tried to send handshake twice");
-			return;
+			return
 		}
 
 		self.handshake = NotificationsInSubstreamHandshake::PendingSend(message.into());
@@ -181,7 +210,10 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 
 	/// Equivalent to `Stream::poll_next`, except that it only drives the handshake and is
 	/// guaranteed to not generate any notification.
-	pub fn poll_process(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Infallible, io::Error>> {
+	pub fn poll_process(
+		self: Pin<&mut Self>,
+		cx: &mut Context,
+	) -> Poll<Result<Infallible, io::Error>> {
 		let mut this = self.project();
 
 		loop {
@@ -198,7 +230,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 						Poll::Pending => {
 							*this.handshake = NotificationsInSubstreamHandshake::PendingSend(msg);
 							return Poll::Pending
-						}
+						},
 					},
 				NotificationsInSubstreamHandshake::Flush =>
 					match Sink::poll_flush(this.socket.as_mut(), cx)? {
@@ -207,7 +239,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 						Poll::Pending => {
 							*this.handshake = NotificationsInSubstreamHandshake::Flush;
 							return Poll::Pending
-						}
+						},
 					},
 
 				st @ NotificationsInSubstreamHandshake::NotSent |
@@ -215,15 +247,16 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 				st @ NotificationsInSubstreamHandshake::ClosingInResponseToRemote |
 				st @ NotificationsInSubstreamHandshake::BothSidesClosed => {
 					*this.handshake = st;
-					return Poll::Pending;
-				}
+					return Poll::Pending
+				},
 			}
 		}
 	}
 }
 
 impl<TSubstream> Stream for NotificationsInSubstream<TSubstream>
-where TSubstream: AsyncRead + AsyncWrite + Unpin,
+where
+	TSubstream: AsyncRead + AsyncWrite + Unpin,
 {
 	type Item = Result<BytesMut, io::Error>;
 
@@ -249,7 +282,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 						Poll::Pending => {
 							*this.handshake = NotificationsInSubstreamHandshake::PendingSend(msg);
 							return Poll::Pending
-						}
+						},
 					},
 				NotificationsInSubstreamHandshake::Flush =>
 					match Sink::poll_flush(this.socket.as_mut(), cx)? {
@@ -258,13 +291,14 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 						Poll::Pending => {
 							*this.handshake = NotificationsInSubstreamHandshake::Flush;
 							return Poll::Pending
-						}
+						},
 					},
 
 				NotificationsInSubstreamHandshake::Sent => {
 					match Stream::poll_next(this.socket.as_mut(), cx) {
-						Poll::Ready(None) => *this.handshake =
-							NotificationsInSubstreamHandshake::ClosingInResponseToRemote,
+						Poll::Ready(None) =>
+							*this.handshake =
+								NotificationsInSubstreamHandshake::ClosingInResponseToRemote,
 						Poll::Ready(Some(msg)) => {
 							*this.handshake = NotificationsInSubstreamHandshake::Sent;
 							return Poll::Ready(Some(msg))
@@ -281,13 +315,13 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 						Poll::Ready(()) =>
 							*this.handshake = NotificationsInSubstreamHandshake::BothSidesClosed,
 						Poll::Pending => {
-							*this.handshake = NotificationsInSubstreamHandshake::ClosingInResponseToRemote;
+							*this.handshake =
+								NotificationsInSubstreamHandshake::ClosingInResponseToRemote;
 							return Poll::Pending
-						}
+						},
 					},
 
-				NotificationsInSubstreamHandshake::BothSidesClosed =>
-					return Poll::Ready(None),
+				NotificationsInSubstreamHandshake::BothSidesClosed => return Poll::Ready(None),
 			}
 		}
 	}
@@ -296,7 +330,8 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin,
 impl NotificationsOut {
 	/// Builds a new potential upgrade.
 	pub fn new(
-		protocol_name: impl Into<Cow<'static, str>>,
+		main_protocol_name: impl Into<Cow<'static, str>>,
+		fallback_names: Vec<Cow<'static, str>>,
 		initial_message: impl Into<Vec<u8>>,
 		max_notification_size: u64,
 	) -> Self {
@@ -305,39 +340,46 @@ impl NotificationsOut {
 			error!(target: "sub-libp2p", "Outbound networking handshake is above allowed protocol limit");
 		}
 
-		NotificationsOut {
-			protocol_name: protocol_name.into(),
-			initial_message,
-			max_notification_size,
-		}
+		let mut protocol_names = fallback_names;
+		protocol_names.insert(0, main_protocol_name.into());
+
+		NotificationsOut { protocol_names, initial_message, max_notification_size }
+	}
+}
+
+/// Implementation of the `ProtocolName` trait, where the protocol name is a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringProtocolName(Cow<'static, str>);
+
+impl upgrade::ProtocolName for StringProtocolName {
+	fn protocol_name(&self) -> &[u8] {
+		self.0.as_bytes()
 	}
 }
 
 impl UpgradeInfo for NotificationsOut {
-	type Info = Cow<'static, [u8]>;
-	type InfoIter = iter::Once<Self::Info>;
+	type Info = StringProtocolName;
+	type InfoIter = vec::IntoIter<Self::Info>;
 
 	fn protocol_info(&self) -> Self::InfoIter {
-		let bytes: Cow<'static, [u8]> = match &self.protocol_name {
-			Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-			Cow::Owned(s) => Cow::Owned(s.as_bytes().to_vec())
-		};
-		iter::once(bytes)
+		self.protocol_names
+			.iter()
+			.cloned()
+			.map(StringProtocolName)
+			.collect::<Vec<_>>()
+			.into_iter()
 	}
 }
 
 impl<TSubstream> OutboundUpgrade<TSubstream> for NotificationsOut
-where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+where
+	TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-	type Output = (Vec<u8>, NotificationsOutSubstream<TSubstream>);
+	type Output = NotificationsOutOpen<TSubstream>;
 	type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 	type Error = NotificationsHandshakeError;
 
-	fn upgrade_outbound(
-		self,
-		mut socket: TSubstream,
-		_: Self::Info,
-	) -> Self::Future {
+	fn upgrade_outbound(self, mut socket: TSubstream, negotiated_name: Self::Info) -> Self::Future {
 		Box::pin(async move {
 			upgrade::write_with_len_prefix(&mut socket, &self.initial_message).await?;
 
@@ -347,7 +389,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 				return Err(NotificationsHandshakeError::TooLarge {
 					requested: handshake_len,
 					max: MAX_HANDSHAKE_SIZE,
-				});
+				})
 			}
 
 			let mut handshake = vec![0u8; handshake_len];
@@ -356,24 +398,41 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 			}
 
 			let mut codec = UviBytes::default();
-			codec.set_max_len(usize::try_from(self.max_notification_size).unwrap_or(usize::max_value()));
+			codec.set_max_len(usize::try_from(self.max_notification_size).unwrap_or(usize::MAX));
 
-			Ok((handshake, NotificationsOutSubstream {
-				socket: Framed::new(socket, codec),
-			}))
+			Ok(NotificationsOutOpen {
+				handshake,
+				negotiated_fallback: if negotiated_name.0 == self.protocol_names[0] {
+					None
+				} else {
+					Some(negotiated_name.0)
+				},
+				substream: NotificationsOutSubstream { socket: Framed::new(socket, codec) },
+			})
 		})
 	}
 }
 
+/// Yielded by the [`NotificationsOut`] after a successfuly upgrade.
+pub struct NotificationsOutOpen<TSubstream> {
+	/// Handshake returned by the remote.
+	pub handshake: Vec<u8>,
+	/// If the negotiated name is not the "main" protocol name but a fallback, contains the
+	/// name of the negotiated fallback.
+	pub negotiated_fallback: Option<Cow<'static, str>>,
+	/// Implementation of `Sink` that allows sending messages on the substream.
+	pub substream: NotificationsOutSubstream<TSubstream>,
+}
+
 impl<TSubstream> Sink<Vec<u8>> for NotificationsOutSubstream<TSubstream>
-	where TSubstream: AsyncRead + AsyncWrite + Unpin,
+where
+	TSubstream: AsyncRead + AsyncWrite + Unpin,
 {
 	type Error = NotificationsOutError;
 
 	fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
 		let mut this = self.project();
-		Sink::poll_ready(this.socket.as_mut(), cx)
-			.map_err(NotificationsOutError::Io)
+		Sink::poll_ready(this.socket.as_mut(), cx).map_err(NotificationsOutError::Io)
 	}
 
 	fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
@@ -384,14 +443,12 @@ impl<TSubstream> Sink<Vec<u8>> for NotificationsOutSubstream<TSubstream>
 
 	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
 		let mut this = self.project();
-		Sink::poll_flush(this.socket.as_mut(), cx)
-			.map_err(NotificationsOutError::Io)
+		Sink::poll_flush(this.socket.as_mut(), cx).map_err(NotificationsOutError::Io)
 	}
 
 	fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
 		let mut this = self.project();
-		Sink::poll_close(this.socket.as_mut(), cx)
-			.map_err(NotificationsOutError::Io)
+		Sink::poll_close(this.socket.as_mut(), cx).map_err(NotificationsOutError::Io)
 	}
 }
 
@@ -418,11 +475,12 @@ impl From<unsigned_varint::io::ReadError> for NotificationsHandshakeError {
 	fn from(err: unsigned_varint::io::ReadError) -> Self {
 		match err {
 			unsigned_varint::io::ReadError::Io(err) => NotificationsHandshakeError::Io(err),
-			unsigned_varint::io::ReadError::Decode(err) => NotificationsHandshakeError::VarintDecode(err),
+			unsigned_varint::io::ReadError::Decode(err) =>
+				NotificationsHandshakeError::VarintDecode(err),
 			_ => {
 				log::warn!("Unrecognized varint decoding error");
 				NotificationsHandshakeError::Io(From::from(io::ErrorKind::InvalidData))
-			}
+			},
 		}
 	}
 }
@@ -436,10 +494,10 @@ pub enum NotificationsOutError {
 
 #[cfg(test)]
 mod tests {
-	use super::{NotificationsIn, NotificationsOut};
+	use super::{NotificationsIn, NotificationsInOpen, NotificationsOut, NotificationsOutOpen};
 
 	use async_std::net::{TcpListener, TcpStream};
-	use futures::{prelude::*, channel::oneshot};
+	use futures::{channel::oneshot, prelude::*};
 	use libp2p::core::upgrade;
 	use std::borrow::Cow;
 
@@ -450,11 +508,13 @@ mod tests {
 
 		let client = async_std::task::spawn(async move {
 			let socket = TcpStream::connect(listener_addr_rx.await.unwrap()).await.unwrap();
-			let (handshake, mut substream) = upgrade::apply_outbound(
+			let NotificationsOutOpen { handshake, mut substream, .. } = upgrade::apply_outbound(
 				socket,
-				NotificationsOut::new(PROTO_NAME, &b"initial message"[..], 1024 * 1024),
-				upgrade::Version::V1
-			).await.unwrap();
+				NotificationsOut::new(PROTO_NAME, Vec::new(), &b"initial message"[..], 1024 * 1024),
+				upgrade::Version::V1,
+			)
+			.await
+			.unwrap();
 
 			assert_eq!(handshake, b"hello world");
 			substream.send(b"test message".to_vec()).await.unwrap();
@@ -465,12 +525,14 @@ mod tests {
 			listener_addr_tx.send(listener.local_addr().unwrap()).unwrap();
 
 			let (socket, _) = listener.accept().await.unwrap();
-			let (initial_message, mut substream) = upgrade::apply_inbound(
+			let NotificationsInOpen { handshake, mut substream, .. } = upgrade::apply_inbound(
 				socket,
-				NotificationsIn::new(PROTO_NAME, 1024 * 1024)
-			).await.unwrap();
+				NotificationsIn::new(PROTO_NAME, Vec::new(), 1024 * 1024),
+			)
+			.await
+			.unwrap();
 
-			assert_eq!(initial_message, b"initial message");
+			assert_eq!(handshake, b"initial message");
 			substream.send_handshake(&b"hello world"[..]);
 
 			let msg = substream.next().await.unwrap().unwrap();
@@ -489,11 +551,13 @@ mod tests {
 
 		let client = async_std::task::spawn(async move {
 			let socket = TcpStream::connect(listener_addr_rx.await.unwrap()).await.unwrap();
-			let (handshake, mut substream) = upgrade::apply_outbound(
+			let NotificationsOutOpen { handshake, mut substream, .. } = upgrade::apply_outbound(
 				socket,
-				NotificationsOut::new(PROTO_NAME, vec![], 1024 * 1024),
-				upgrade::Version::V1
-			).await.unwrap();
+				NotificationsOut::new(PROTO_NAME, Vec::new(), vec![], 1024 * 1024),
+				upgrade::Version::V1,
+			)
+			.await
+			.unwrap();
 
 			assert!(handshake.is_empty());
 			substream.send(Default::default()).await.unwrap();
@@ -504,12 +568,14 @@ mod tests {
 			listener_addr_tx.send(listener.local_addr().unwrap()).unwrap();
 
 			let (socket, _) = listener.accept().await.unwrap();
-			let (initial_message, mut substream) = upgrade::apply_inbound(
+			let NotificationsInOpen { handshake, mut substream, .. } = upgrade::apply_inbound(
 				socket,
-				NotificationsIn::new(PROTO_NAME, 1024 * 1024)
-			).await.unwrap();
+				NotificationsIn::new(PROTO_NAME, Vec::new(), 1024 * 1024),
+			)
+			.await
+			.unwrap();
 
-			assert!(initial_message.is_empty());
+			assert!(handshake.is_empty());
 			substream.send_handshake(vec![]);
 
 			let msg = substream.next().await.unwrap().unwrap();
@@ -528,9 +594,10 @@ mod tests {
 			let socket = TcpStream::connect(listener_addr_rx.await.unwrap()).await.unwrap();
 			let outcome = upgrade::apply_outbound(
 				socket,
-				NotificationsOut::new(PROTO_NAME, &b"hello"[..], 1024 * 1024),
-				upgrade::Version::V1
-			).await;
+				NotificationsOut::new(PROTO_NAME, Vec::new(), &b"hello"[..], 1024 * 1024),
+				upgrade::Version::V1,
+			)
+			.await;
 
 			// Despite the protocol negotiation being successfully conducted on the listener
 			// side, we have to receive an error here because the listener didn't send the
@@ -543,12 +610,14 @@ mod tests {
 			listener_addr_tx.send(listener.local_addr().unwrap()).unwrap();
 
 			let (socket, _) = listener.accept().await.unwrap();
-			let (initial_msg, substream) = upgrade::apply_inbound(
+			let NotificationsInOpen { handshake, substream, .. } = upgrade::apply_inbound(
 				socket,
-				NotificationsIn::new(PROTO_NAME, 1024 * 1024)
-			).await.unwrap();
+				NotificationsIn::new(PROTO_NAME, Vec::new(), 1024 * 1024),
+			)
+			.await
+			.unwrap();
 
-			assert_eq!(initial_msg, b"hello");
+			assert_eq!(handshake, b"hello");
 
 			// We successfully upgrade to the protocol, but then close the substream.
 			drop(substream);
@@ -567,9 +636,15 @@ mod tests {
 			let ret = upgrade::apply_outbound(
 				socket,
 				// We check that an initial message that is too large gets refused.
-				NotificationsOut::new(PROTO_NAME, (0..32768).map(|_| 0).collect::<Vec<_>>(), 1024 * 1024),
-				upgrade::Version::V1
-			).await;
+				NotificationsOut::new(
+					PROTO_NAME,
+					Vec::new(),
+					(0..32768).map(|_| 0).collect::<Vec<_>>(),
+					1024 * 1024,
+				),
+				upgrade::Version::V1,
+			)
+			.await;
 			assert!(ret.is_err());
 		});
 
@@ -580,8 +655,9 @@ mod tests {
 			let (socket, _) = listener.accept().await.unwrap();
 			let ret = upgrade::apply_inbound(
 				socket,
-				NotificationsIn::new(PROTO_NAME, 1024 * 1024)
-			).await;
+				NotificationsIn::new(PROTO_NAME, Vec::new(), 1024 * 1024),
+			)
+			.await;
 			assert!(ret.is_err());
 		});
 
@@ -597,9 +673,10 @@ mod tests {
 			let socket = TcpStream::connect(listener_addr_rx.await.unwrap()).await.unwrap();
 			let ret = upgrade::apply_outbound(
 				socket,
-				NotificationsOut::new(PROTO_NAME, &b"initial message"[..], 1024 * 1024),
-				upgrade::Version::V1
-			).await;
+				NotificationsOut::new(PROTO_NAME, Vec::new(), &b"initial message"[..], 1024 * 1024),
+				upgrade::Version::V1,
+			)
+			.await;
 			assert!(ret.is_err());
 		});
 
@@ -608,11 +685,13 @@ mod tests {
 			listener_addr_tx.send(listener.local_addr().unwrap()).unwrap();
 
 			let (socket, _) = listener.accept().await.unwrap();
-			let (initial_message, mut substream) = upgrade::apply_inbound(
+			let NotificationsInOpen { handshake, mut substream, .. } = upgrade::apply_inbound(
 				socket,
-				NotificationsIn::new(PROTO_NAME, 1024 * 1024)
-			).await.unwrap();
-			assert_eq!(initial_message, b"initial message");
+				NotificationsIn::new(PROTO_NAME, Vec::new(), 1024 * 1024),
+			)
+			.await
+			.unwrap();
+			assert_eq!(handshake, b"initial message");
 
 			// We check that a handshake that is too large gets refused.
 			substream.send_handshake((0..32768).map(|_| 0).collect::<Vec<_>>());

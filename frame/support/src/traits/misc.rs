@@ -17,9 +17,9 @@
 
 //! Smaller traits used in FRAME which don't need their own file.
 
-use sp_runtime::traits::{StoredMapError, Block as BlockT};
-use sp_arithmetic::traits::AtLeast32Bit;
 use crate::dispatch::Parameter;
+use sp_arithmetic::traits::AtLeast32Bit;
+use sp_runtime::{traits::Block as BlockT, DispatchError};
 
 /// Anything that can have a `::len()` method.
 pub trait Len {
@@ -27,7 +27,10 @@ pub trait Len {
 	fn len(&self) -> usize;
 }
 
-impl<T: IntoIterator + Clone,> Len for T where <T as IntoIterator>::IntoIter: ExactSizeIterator {
+impl<T: IntoIterator + Clone> Len for T
+where
+	<T as IntoIterator>::IntoIter: ExactSizeIterator,
+{
 	fn len(&self) -> usize {
 		self.clone().into_iter().len()
 	}
@@ -42,7 +45,9 @@ pub trait Get<T> {
 }
 
 impl<T: Default> Get<T> for () {
-	fn get() -> T { T::default() }
+	fn get() -> T {
+		T::default()
+	}
 }
 
 /// Implement Get by returning Default for any type that implements Default.
@@ -50,6 +55,21 @@ pub struct GetDefault;
 impl<T: Default> Get<T> for GetDefault {
 	fn get() -> T {
 		T::default()
+	}
+}
+
+/// Implement `Get<u32>` and `Get<Option<u32>>` using the given const.
+pub struct ConstU32<const T: u32>;
+
+impl<const T: u32> Get<u32> for ConstU32<T> {
+	fn get() -> u32 {
+		T
+	}
+}
+
+impl<const T: u32> Get<Option<u32>> for ConstU32<T> {
+	fn get() -> Option<u32> {
+		Some(T)
 	}
 }
 
@@ -108,7 +128,10 @@ impl<A, B> SameOrOther<A, B> {
 		}
 	}
 
-	pub fn same(self) -> Result<A, B> where A: Default {
+	pub fn same(self) -> Result<A, B>
+	where
+		A: Default,
+	{
 		match self {
 			SameOrOther::Same(a) => Ok(a),
 			SameOrOther::None => Ok(A::default()),
@@ -116,7 +139,10 @@ impl<A, B> SameOrOther<A, B> {
 		}
 	}
 
-	pub fn other(self) -> Result<B, A> where B: Default {
+	pub fn other(self) -> Result<B, A>
+	where
+		B: Default,
+	{
 		match self {
 			SameOrOther::Same(a) => Err(a),
 			SameOrOther::None => Ok(B::default()),
@@ -142,10 +168,14 @@ pub trait OnKilledAccount<AccountId> {
 /// A simple, generic one-parameter event notifier/handler.
 pub trait HandleLifetime<T> {
 	/// An account was created.
-	fn created(_t: &T) -> Result<(), StoredMapError> { Ok(()) }
+	fn created(_t: &T) -> Result<(), DispatchError> {
+		Ok(())
+	}
 
 	/// An account was killed.
-	fn killed(_t: &T) -> Result<(), StoredMapError> { Ok(()) }
+	fn killed(_t: &T) -> Result<(), DispatchError> {
+		Ok(())
+	}
 }
 
 impl<T> HandleLifetime<T> for () {}
@@ -180,10 +210,18 @@ pub trait IsType<T>: Into<T> + From<T> {
 }
 
 impl<T> IsType<T> for T {
-	fn from_ref(t: &T) -> &Self { t }
-	fn into_ref(&self) -> &T { self }
-	fn from_mut(t: &mut T) -> &mut Self { t }
-	fn into_mut(&mut self) -> &mut T { self }
+	fn from_ref(t: &T) -> &Self {
+		t
+	}
+	fn into_ref(&self) -> &T {
+		self
+	}
+	fn from_mut(t: &mut T) -> &mut Self {
+		t
+	}
+	fn into_mut(&mut self) -> &mut T {
+		self
+	}
 }
 
 /// Something that can be checked to be a of sub type `T`.
@@ -283,4 +321,40 @@ pub trait GetBacking {
 	/// Returns `Some` `Backing` if `self` represents a fractional/groupwise backing of some
 	/// implicit motion. `None` if it does not.
 	fn get_backing(&self) -> Option<Backing>;
+}
+
+/// A trait to ensure the inherent are before non-inherent in a block.
+///
+/// This is typically implemented on runtime, through `construct_runtime!`.
+pub trait EnsureInherentsAreFirst<Block> {
+	/// Ensure the position of inherent is correct, i.e. they are before non-inherents.
+	///
+	/// On error return the index of the inherent with invalid position (counting from 0).
+	fn ensure_inherents_are_first(block: &Block) -> Result<(), u32>;
+}
+
+/// An extrinsic on which we can get access to call.
+pub trait ExtrinsicCall: sp_runtime::traits::Extrinsic {
+	/// Get the call of the extrinsic.
+	fn call(&self) -> &Self::Call;
+}
+
+#[cfg(feature = "std")]
+impl<Call, Extra> ExtrinsicCall for sp_runtime::testing::TestXt<Call, Extra>
+where
+	Call: codec::Codec + Sync + Send,
+{
+	fn call(&self) -> &Self::Call {
+		&self.call
+	}
+}
+
+impl<Address, Call, Signature, Extra> ExtrinsicCall
+	for sp_runtime::generic::UncheckedExtrinsic<Address, Call, Signature, Extra>
+where
+	Extra: sp_runtime::traits::SignedExtension,
+{
+	fn call(&self) -> &Self::Call {
+		&self.function
+	}
 }
